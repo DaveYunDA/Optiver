@@ -1,0 +1,311 @@
+---
+title: "Untitled"
+author: "Taoyi Wang"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(rugarch)
+stock1 <- read.csv("stock_1.csv")
+
+```
+
+```{r}
+stock1 <- stock1 %>% mutate(
+  WAP = (bid_price1 * ask_size1 + ask_price1 * bid_size1) / (bid_size1 + ask_size1))
+stock1 <- stock1 %>% mutate(BidAskSpread = ask_price1 / bid_price1 - 1)
+head(stock1)
+WAP1 <- stock1 %>% filter(time_id == 5 & seconds_in_bucket == 16) %>% pull(WAP)
+WAP2 <- stock1 %>% filter(time_id == 5 & seconds_in_bucket == 15) %>% pull(WAP)
+log_r <- log(WAP1 / WAP2)
+```
+```{r}
+log_r1 <- list()
+time_IDs <- unique(stock1[, 1])[1:500]
+for (i in 1 : length(time_IDs)) {
+  sec <- stock1 %>% filter(time_id == time_IDs[i]) %>% pull(seconds_in_bucket)
+  price <- stock1 %>% filter(time_id == time_IDs[i]) %>% pull(WAP)
+  log_r <- log(price[-1] / price[1:(length(price) - 1)])
+  log_r1[[i]] <- data.frame(time = sec[-1], log_return = log_r)
+  time.no.change <- (1:600)[!(1:600 %in% log_r1[[i]]$time)]
+  if (length(time.no.change) > 0) {
+    new.df <- data.frame(time = time.no.change, log_return = 0)
+    log_r1[[i]] <- rbind(log_r1[[i]], new.df)
+    log_r1[[i]] <- log_r1[[i]][order(log_r1[[i]]$time), ]
+  }
+}
+
+vol <- list()
+comp_vol <- function(x) {
+  return(sqrt(sum(x ^ 2)))
+}
+for (i in 1 : length(log_r1)) {
+  log_r1[[i]] <- log_r1[[i]] %>% mutate(time_bucket = ceiling(time / 30))
+  vol[[i]] <- aggregate(log_return ~ time_bucket, data = log_r1[[i]], FUN = comp_vol)
+  colnames(vol[[i]]) <- c('time_bucket', 'volatility')
+}
+```
+
+```{r}
+ggplot(data = vol[[1]], aes(x = time_bucket, y = volatility)) + geom_line() + geom_point() 
+acf(log_r1[[1]]$log_return, main = "ACF plot for log returns")
+```
+```{r}
+vol.train <- list()
+vol.val <- list()
+
+for (i in 1 : length(log_r1)) {
+  vol.train[[i]] <- vol[[i]][1:16, ]
+  vol.val[[i]] <- vol[[i]][-(1:16), ]
+}
+```
+
+```{r}
+list.HAV <- list()
+
+for (i in 1 : length(vol)) {
+  mean.vol <- rep(0, len.train - 5)
+  for (j in 1 : 5) {
+    mean.vol <- mean.vol + vol.train[[i]]$volatility[j : (j + len.train - 6)] / 5
+  }
+  list.HAV[[i]] <- data.frame(vol = vol.train[[i]]$volatility[-(1:5)], 
+                              vol_1 = vol.train[[i]]$volatility[5:(len.train - 1)],
+                              mean_vol_5 = mean.vol)
+}
+```
+
+```{r}
+quar <- list()
+comp_quar <- function(x) {
+  return(length(x) / 3 * sum(x ^ 4))
+}
+for (i in 1 : length(log_r1)) {
+  quar[[i]] <- aggregate(log_return ~ time_bucket, data = log_r1[[i]], FUN = comp_quar)
+  colnames(quar[[i]]) <- c('time_bucket', 'quarticity')
+}
+
+HAV.ols.models <- list()
+HAV.wls.models <- list()
+
+for (i in 1 : length(vol)) {
+  HAV.ols.models[[i]] <- lm(vol ~ vol_1 + mean_vol_5, list.HAV[[i]])
+  
+  # weight.HAV <- 0
+  HAV.wls.models[[i]] <- lm(vol ~ vol_1 + mean_vol_5, list.HAV[[i]],
+                            weights = list.HAV[[i]]$vol_1 / 
+                              sqrt(quar[[i]]$quarticity[5:(len.train - 1)]))
+}
+
+# HAV-RV performs well for some time buckets
+summary(HAV.wls.models[[218]])
+```
+```{r}
+list.HAV.val <- list()
+len.val <- length(vol.val[[1]]$volatility)
+pred.HAV <- list()
+
+for (i in 1 : length(vol)) {
+  # Create a new dataframe with the same structure as list.HAV used for model fitting
+  list.HAV.val[[i]] <- data.frame(vol = vol.val[[i]]$volatility[-1],
+                                   vol_1 = vol.val[[i]]$volatility[-length(vol.val[[i]]$volatility)],
+                                   mean_vol_5 = sapply(1:(len.val - 1), function(j) {
+                                     return(mean(vol.val[[i]]$volatility[max(1, j - 4):j]))
+                                   }))
+  
+  # Predict using the constructed list.HAV.val data
+  pred.HAV[[i]] <- predict(HAV.wls.models[[i]], newdata = list.HAV.val[[i]])
+}
+```
+
+
+```{r}
+pred.HAV
+```
+
+
+```{r}
+# Initialize lists to store QLIKE and MSE values for each time_id
+QLIKE_list <- list()
+MSE_list <- list()
+
+# Compute QLIKE and MSE for each time_id
+for (i in 1 : length(vol)) {
+  # QLIKE
+  QLIKE_list[[i]] <- (list.HAV.val[[i]]$vol - pred.HAV[[i]])^2 / list.HAV.val[[i]]$vol
+  # MSE
+  MSE_list[[i]] <- (list.HAV.val[[i]]$vol - pred.HAV[[i]])^2
+}
+
+# Convert lists to data.frames
+QLIKE_df <- do.call(rbind, lapply(QLIKE_list, function(x) data.frame(QLIKE = x)))
+MSE_df <- do.call(rbind, lapply(MSE_list, function(x) data.frame(MSE = x)))
+
+
+# Box plot for QLIKE
+QLIKE_plot <- ggplot(data = QLIKE_df, aes(x = factor(0), y = QLIKE)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(x = "", y = "QLIKE", title = "Box plot of QLIKE")
+
+# Box plot for MSE
+MSE_plot <- ggplot(data = MSE_df, aes(x = factor(0), y = MSE)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(x = "", y = "MSE", title = "Box plot of MSE")
+
+# Display the plots
+QLIKE_plot
+MSE_plot
+```
+QLIKE:
+
+The QLIKE box plot shows the distribution of the Quasi-Likelihood Exponential (QLIKE) values for the validation data set. QLIKE is a measure of the model's goodness of fit and is often used to compare the performance of volatility models.
+The median QLIKE value is represented by the horizontal line inside the box, which shows the central tendency of the QLIKE distribution.
+The box represents the interquartile range (IQR), containing the middle 50% of the data, indicating the spread or dispersion of QLIKE values.
+Whiskers extend from the box to the minimum and maximum QLIKE values within 1.5 times the IQR. Outliers outside of this range are plotted as individual points.
+MSE:
+
+The MSE box plot shows the distribution of the Mean Squared Error (MSE) values for the validation data set. MSE is a widely used measure of the model's prediction accuracy.
+The median MSE value is represented by the horizontal line inside the box, which shows the central tendency of the MSE distribution.
+The box represents the interquartile range (IQR), containing the middle 50% of the data, indicating the spread or dispersion of MSE values.
+Whiskers extend from the box to the minimum and maximum MSE values within 1.5 times the IQR. Outliers outside of this range are plotted as individual points.
+By analyzing the box plots for QLIKE and MSE, you can draw conclusions about the performance of the HAV-RV model in predicting the volatility of the validation data set. Lower QLIKE and MSE values indicate better model performance, while higher values suggest that the model's predictions may be less accurate.
+
+It's important to compare these results with other models to determine if the HAV-RV model is suitable for your specific use case, or if alternative models may provide better predictive performance. Additionally, you can consider using cross-validation techniques to further assess the model's robustness and reliability in predicting future realized volatility.
+
+
+
+```{r}
+i <- 4
+
+
+min_length <- min(length(vol.val[[i]]$volatility), length(pred.HAV[[i]]))
+
+
+visualization_data <- data.frame(
+  time_bucket = vol.val[[i]]$time_bucket[1:min_length],
+  realized_volatility = vol.val[[i]]$volatility[1:min_length],
+  predicted_volatility = pred.HAV[[i]][1:min_length]
+)
+
+
+volatility_plot <- ggplot() +
+  geom_line(data = visualization_data, aes(x = time_bucket, y = realized_volatility, color = "Realized Volatility")) +
+  geom_line(data = visualization_data, aes(x = time_bucket, y = predicted_volatility, color = "Predicted Volatility")) +
+  theme_minimal() +
+  labs(x = "Time Bucket", y = "Volatility", title = "Realized vs. Predicted Volatility") +
+  scale_color_manual(values = c("Realized Volatility" = "blue", "Predicted Volatility" = "red")) +
+  theme(legend.title = element_blank())
+
+
+volatility_plot
+
+
+
+```
+
+This code creates a line plot comparing the realized volatility (blue) and predicted volatility (red) for a chosen time_id from the validation data set. You can change the value of 'i' to visualize other time_ids.
+
+By examining the plot, you can observe how well the HAV-RV model's predictions match the actual realized volatility. If the predicted volatility line closely follows the realized volatility line, it indicates that the model is accurately predicting the volatility. However, if the lines diverge significantly, it suggests that the model's predictions may be less accurate, and alternative models or improvements to the current model should be considered.
+
+```{r}
+list.OLS2 <- list()
+for (i in 1 : length(vol)) {
+  list.OLS2[[i]] <- data.frame(vol = vol.train[[i]]$volatility[-(1:5)], 
+                               mean_vol_5 = list.HAV[[i]]$mean_vol_5)
+}
+
+OLS2.models <- list()
+for (i in 1 : length(vol)) {
+  OLS2.models[[i]] <- lm(vol ~ mean_vol_5, list.OLS2[[i]])
+}
+
+list.OLS2.val <- list()
+pred.OLS2 <- list()
+
+for (i in 1 : length(vol)) {
+  list.OLS2.val[[i]] <- data.frame(mean_vol_5 = list.HAV.val[[i]]$mean_vol_5)
+  pred.OLS2[[i]] <- predict(OLS2.models[[i]], newdata = list.OLS2.val[[i]])
+}
+
+
+```
+
+```{r}
+# Initialize data.frames to store QLIKE and MSE values for each time_id
+QLIKE_df <- data.frame()
+MSE_df <- data.frame()
+
+# Compute QLIKE and MSE for each time_id
+for (i in 1 : length(vol)) {
+  # QLIKE
+  QLIKE_temp <- data.frame(Model = rep(c("HAV", "OLS2"), each = length(vol.val[[i]]$volatility)),
+                           QLIKE = c((vol.val[[i]]$volatility - pred.HAV[[i]])^2 / vol.val[[i]]$volatility,
+                                     (vol.val[[i]]$volatility - pred.OLS2[[i]])^2 / vol.val[[i]]$volatility))
+  QLIKE_df <- rbind(QLIKE_df, QLIKE_temp)
+  
+  # MSE
+  MSE_temp <- data.frame(Model = rep(c("HAV", "OLS2"), each = length(vol.val[[i]]$volatility)),
+                         MSE = c((vol.val[[i]]$volatility - pred.HAV[[i]])^2,
+                                 (vol.val[[i]]$volatility - pred.OLS2[[i]])^2))
+  MSE_df <- rbind(MSE_df, MSE_temp)
+}
+
+# Box plot for QLIKE
+QLIKE_plot <- ggplot(data = QLIKE_df, aes(x = Model, y = QLIKE, fill = Model)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(x = "Model", y = "QLIKE", title = "Box plot of QLIKE")
+
+# Box plot for MSE
+MSE_plot <- ggplot(data = MSE_df, aes(x = Model, y = MSE, fill = Model)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(x = "Model", y = "MSE", title = "Box plot of MSE")
+
+# Display the plots
+QLIKE_plot
+MSE_plot
+
+
+```
+
+```{r}
+# Set the time_id to visualize
+time_id_to_visualize <- 1
+
+min_length <- min(length(vol.val[[i]]$volatility), length(pred.HAV[[i]]))
+
+# Create a data frame for visualization
+visualization_df <- data.frame(
+  time_bucket = vol.val[[time_id_to_visualize]]$time_bucket[1:min_length],
+  realized_volatility = vol.val[[time_id_to_visualize]]$volatility[1:min_length],
+  predicted_volatility_HAV = pred.HAV[[time_id_to_visualize]][1:min_length],
+  predicted_volatility_OLS2 = pred.OLS2[[time_id_to_visualize]][1:min_length]
+)
+
+# Reshape the data frame to long format for ggplot
+visualization_long_df <- reshape2::melt(visualization_df, id.vars = "time_bucket", variable.name = "Model", value.name = "Volatility")
+
+# Create a line plot
+volatility_plot <- ggplot(visualization_long_df, aes(x = time_bucket, y = Volatility, color = Model)) +
+  geom_line() +
+  theme_minimal() +
+  labs(x = "Time Bucket", y = "Volatility", title = paste("Realized vs. Predicted Volatility for Time ID", time_IDs[time_id_to_visualize])) +
+  scale_color_manual(values = c("black", "blue", "red"))
+
+# Display the plot
+volatility_plot
+
+```
+
+
+
